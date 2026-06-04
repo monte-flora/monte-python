@@ -2,9 +2,14 @@
 
 import setuptools  # this is the "magic" import
 
-import monte_python
+# Do NOT import monte_python here — that triggers monte_python/__init__.py
+# which imports cv2, scikit-image, xarray, etc. Those don't exist yet at
+# setup time on a clean env, so pip install fails with ModuleNotFoundError.
+# Version is canonical at monte_python/__init__.py (fallback '1.1.0' when
+# PACKAGE_VERSION env var is unset); mirror that literal here.
+_VERSION = '1.1.0'
 
-from numpy.distutils.core import setup, Extension
+from setuptools import setup
 
 #from setuptools import setup, find_packages
 import pathlib
@@ -16,7 +21,7 @@ long_description = (here / 'README.md').read_text(encoding='utf-8')
 
 setup(
     name='monte_python', 
-    version=monte_python.__version__,
+    version=_VERSION,
     description='Methods for Object-based and Neighborhood Threat Evaluation in Python', 
     long_description=long_description,
     long_description_content_type='text/markdown',  
@@ -39,6 +44,9 @@ setup(
         'numba',
         'numba-kdtree',
         'scipy',
+        # cv2 is imported from monte_python.object_identification.
+        # Use the headless variant for server envs (no Qt5/X11).
+        'opencv-python-headless',
     ],
     packages=['monte_python', 'monte_python._plot'],  # Required
     python_requires='>=3.8, <4',
