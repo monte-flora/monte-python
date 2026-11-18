@@ -4,13 +4,15 @@ streaming-tracker day (144 frames at 10 min) with peak RSS.
     python bench/bench_conus.py ew  [ncells]          # one frame: Rust / Python timing + label equality
     python bench/bench_conus.py day [ncells] [nfr]    # split_objects + StreamingTracker over nfr frames
     python bench/bench_conus.py trk ncells nfr WHICH  # one tracker over a day of split_objects frames; WHICH:
-        ot-rust | ot-python (ObjectTracker streaming, mending on) | streaming (StreamingTracker) | none
+        ot-rust | ot-python (ObjectTracker streaming, mending on) | streaming (StreamingTracker) | none |
+        td1071 (twc-severe-wx TD-1071 track.py Tracker; path in $TD1071_TRACK)
 """
 import resource
 import sys
 import time
 
 import numpy as np
+import pandas as pd
 
 import monte_python
 from monte_python.EnhancedWatershedSegmenter import EnhancedWatershed
@@ -102,6 +104,13 @@ def bench_trk(ncells, nfr, which):
         tr = monte_python.ObjectTracker(backend="python")
     elif which == "streaming":
         tr = monte_python.StreamingTracker()
+    elif which == "td1071":
+        import importlib.util
+        import os
+        spec = importlib.util.spec_from_file_location("td1071_track", os.environ["TD1071_TRACK"])
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        tr = mod.Tracker(V=1)
     else:
         tr = None
     ts = []
@@ -113,11 +122,18 @@ def bench_trk(ncells, nfr, which):
             base = rss_mb()
         if tr is not None:
             t = time.perf_counter()
-            tr.step(lab)
+            if which == "td1071":
+                idx = np.flatnonzero(lab > 0)
+                tr.step(k, idx, lab.ravel()[idx].astype(np.int64), lab)
+            else:
+                tr.step(lab)
             ts.append(time.perf_counter() - t)
     ts = np.array(ts) if ts else np.zeros(1)
-    n = len(tr.table()) if tr is not None else 0
-    ntrk = tr.table()["track"].nunique() if tr is not None else 0
+    if which == "td1071":
+        tab = pd.DataFrame(tr.log, columns=["frame", "track", "area", "cy", "cx"])
+    else:
+        tab = tr.table() if tr is not None else pd.DataFrame({"track": []})
+    n, ntrk = len(tab), tab["track"].nunique()
     print(f"{which}: frames {nfr} track s/frame p50 {np.median(ts):.3f} p90 {np.percentile(ts, 90):.3f} "
           f"p99 {np.percentile(ts, 99):.3f} max {ts.max():.3f} total {ts.sum():.1f} s  records {n} tracks {ntrk}  "
           f"maxrss MB {rss_mb():.0f} (after frame 0 {base:.0f})")
