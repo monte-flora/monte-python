@@ -1,26 +1,63 @@
-name: CI 
+name: CI
 
-on : [push, pull_request]
+on: [push, pull_request]
 
 jobs:
-  unit_tests: 
-    name : Unit Tests
+  unit_tests:
+    name: Unit tests (py${{ matrix.python-version }}, ${{ matrix.build }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.8"]
-    steps: 
-    - uses: actions/checkout@v2
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python --version 
-        python3 -m pip install --upgrade pytest-cov codecov coverage
-        python -m pip install --no-build-isolation -r requirements.txt
-    
-    - name: Run the test scripts 
-      run: |
-        python -m pytest --import-mode=append tests/
+        python-version: ["3.10", "3.11", "3.12"]
+        build: ["rust"]
+        include:
+          - python-version: "3.11"
+            build: "pure-python"   # the fallback without the compiled core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.build == 'rust'
+      - name: Install (Rust core)
+        if: matrix.build == 'rust'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[all,test]" scikit-learn
+          python -c "import monte_python; assert monte_python.HAS_RUST"
+      - name: Install (pure Python, no extension)
+        if: matrix.build == 'pure-python'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy scikit-image pandas matplotlib opencv-python-headless numba xarray pytest psutil
+          PYTHONPATH=. python -c "import monte_python; assert not monte_python.HAS_RUST"
+      - name: Rust unit tests
+        if: matrix.build == 'rust'
+        run: cargo test --release --manifest-path rust/Cargo.toml --lib
+      - name: Tests
+        run: |
+          # run against the installed package (rust) or the source tree (pure-python)
+          if [ "${{ matrix.build }}" = "rust" ]; then cd tests && python -m pytest -q -p no:cacheprovider . ; else PYTHONPATH=. python -m pytest -q tests ; fi
+
+  wheels:
+    name: abi3 wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: dist/*.whl

@@ -1,28 +1,22 @@
-import scipy
 import numpy as np
 import skimage.measure
 from math import sqrt
-from skimage.measure import regionprops 
-from skimage.util import img_as_ubyte
-from skimage.filters.rank import modal
-from sklearn.neighbors import KDTree
-from scipy.ndimage import generic_filter
+from skimage.measure import regionprops
 from skimage.morphology import disk
-import random
-import copy 
+from scipy.spatial import cKDTree
+import copy
 import warnings
 warnings.simplefilter("ignore", UserWarning)
 
 #mcit
-import cv2
 from scipy import ndimage as ndi
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
 
 
-from .object_matching import ObjectMatcher
+from .object_matching import ObjectMatcher  # noqa: F401
 from .object_quality_control import QualityControler
-from .EnhancedWatershedSegmenter import EnhancedWatershed, rescale_data
+from .EnhancedWatershedSegmenter import EnhancedWatershed, rescale_data  # noqa: F401
 
 
 def label(input_data, params, method='watershed', return_object_properties=True):
@@ -144,7 +138,7 @@ def label(input_data, params, method='watershed', return_object_properties=True)
     elif method == "watershed":
         ider = EnhancedWatershed(**params)
     elif method == "mcit":
-        ider = MCIT_Identifier(**params)
+        ider = MCIT_Identifier(params)
     else:
         if 'bdry_thresh' not in params.keys():
             raise KeyError("""
@@ -230,6 +224,31 @@ def quantize_probabilities(ensemble_probabilities, ensemble_size):
     for value in np.unique(q_data)[1:]:
         q_data[q_data==value] = possible_probabilities[int(value)]
     return q_data
+
+def modal_filter(labels, radius=2):
+    """Most common label within a disk of ``radius`` (in-grid pixels only; ties go to the smallest label), the
+    rule of ``skimage.filters.rank.modal`` without its uint8/uint16 limit."""
+    labels = np.asarray(labels)
+    ny, nx = labels.shape
+    fp = disk(radius).astype(bool)
+    offsets = [(i - radius, j - radius) for i, j in zip(*np.nonzero(fp))]
+    big = np.iinfo(np.int64).max
+    padded = np.full((ny + 2 * radius, nx + 2 * radius), big, dtype=np.int64)
+    padded[radius:radius + ny, radius:radius + nx] = labels
+    stack = np.stack([padded[radius + di:radius + di + ny, radius + dj:radius + dj + nx] for di, dj in offsets])
+    stack.sort(axis=0)
+    k = stack.shape[0]
+    # run length ending at each sorted position
+    run = np.ones(stack.shape, dtype=np.int32)
+    for i in range(1, k):
+        same = stack[i] == stack[i - 1]
+        run[i] = np.where(same, run[i - 1] + 1, 1)
+    run[stack == big] = 0
+    # first (smallest value) position of the maximal run length
+    best = np.argmax(run, axis=0)
+    out = np.take_along_axis(stack, best[None], axis=0)[0]
+    return out.astype(labels.dtype, copy=False)
+
 
 class SingleThresholdIdentifier:
     """
@@ -369,9 +388,8 @@ class IterativeWatershed:
         I.e., assigned the most common label within a 
         2-grid point radius
         """
-       # Run modal filter
-        labelled_data = img_as_ubyte(labelled_data)
-        new_labels = modal(labelled_data, disk(2))
+        # Run modal filter (any number of labels; img_as_ubyte here used to wrap labels > 255)
+        new_labels = modal_filter(labelled_data, radius=2)
         new_labels[labelled_data==0] = 0
 
         return new_labels
@@ -414,11 +432,11 @@ class IterativeWatershed:
             return labelled_array
 
         X = np.array(list(region_coords.keys()))
-        tree = KDTree(X, leaf_size=40,)
-        # Should I check the distance? 
-        ind = tree.query(original_nonzero_coords, k=1, return_distance=False,)
-        for k, idx in enumerate(ind):
-            labelled_array[tuple(original_nonzero_coords[k,:])] = region_coords[tuple(X[idx[0],:])]
+        tree = cKDTree(X)
+        # Should I check the distance?
+        _, ind = tree.query(original_nonzero_coords, k=1)
+        for k, idx in enumerate(np.atleast_1d(ind)):
+            labelled_array[tuple(original_nonzero_coords[k,:])] = region_coords[tuple(X[idx,:])]
 
         return labelled_array
 
@@ -632,12 +650,13 @@ class MCIT_Identifier:
                 min_value
                 valley_depth
     """
-    def __init__(self, params: dict = None):
-        self.min_value = np.nan 
+    def __init__(self, params: dict = None, **kwargs):
+        self.min_value = np.nan
         self.valley_depth = np.nan
+        # label(method="mcit", params={...}) passes the dict; MCIT_Identifier(min_value=..., valley_depth=...) works too
+        if params is None and kwargs:
+            params = kwargs
         self.params = params
-
-        print("mcit params: " % (params))
 
         if self.params is not None:
             self.min_value = self.params['min_value'] 
@@ -649,7 +668,7 @@ class MCIT_Identifier:
     
     def label(self, input_data):
 
-        if self.min_value == np.nan or self.valley_depth == np.nan:
+        if np.isnan(self.min_value) or np.isnan(self.valley_depth):
             mean = np.mean(input_data)
             std = np.std(input_data)
 
@@ -783,9 +802,9 @@ class MCIT_Identifier:
 
     def _binarize(self, input_data):
         """ Binarizes input_data with the object boundary threshold"""
-        binary  = np.where(np.round(input_data, 10) >= round(thresh, 10), 1, 0) 
+        binary  = np.where(np.round(input_data, 10) >= round(self.min_value, 10), 1, 0)
         binary  = binary.astype(int)
-        return binary 
+        return binary
 
     def get_neighboring_labels(self, labels_arr: np.ndarray,
                            target_id: int):
