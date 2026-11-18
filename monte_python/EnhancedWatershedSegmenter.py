@@ -43,6 +43,8 @@ class EnhancedWatershed(object):
 
     def __init__(self, min_thresh, max_thresh, area_threshold, dist_btw_objects, data_increment=1,
                  min_size=6, use_rust=None):
+        if not data_increment > 0:
+            raise ValueError(f"data_increment must be > 0, got {data_increment}")
         self.min_thresh = min_thresh
         self.data_increment = data_increment
         self.max_thresh = max_thresh
@@ -75,7 +77,8 @@ class EnhancedWatershed(object):
             centers = self.find_local_maxima(pixels, q_data)
             marked = self.grow_centers(centers, q_data)
         if only_objects:
-            marked = np.where(marked > 0, marked, 0).astype(np.int32)
+            marked = np.asarray(marked, dtype=np.int32)
+            np.maximum(marked, 0, out=marked)
         return marked
 
     def _label_rust(self, input_grid):

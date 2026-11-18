@@ -43,6 +43,12 @@ pub fn quantize<T: Copy + Into<f64>>(data: &[T], p: &Params) -> Vec<i32> {
             if !x.is_finite() {
                 return -1;
             }
+            // fast path for the (usually most) pixels below threshold: trunc(x) - min < 0 gives a negative bin
+            // for any increment > 0, so the floor division (an fmod) is skipped; same result as below
+            let t = x.trunc() - p.min_thresh;
+            if t < 0.0 && p.data_increment > 0.0 {
+                return -1;
+            }
             let d = py_floordiv(x.trunc() - p.min_thresh, p.data_increment);
             let bad = if p.min_thresh == 0.0 { d <= 0.0 } else { d < 0.0 };
             if bad {

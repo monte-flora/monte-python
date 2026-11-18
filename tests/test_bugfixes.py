@@ -104,3 +104,18 @@ def test_qc_chain_unchanged(fake_storms):
                                      [("min_area", 150), ("merge_thresh", 3), ("max_thresh", (40, 90))])
     assert new.dtype == np.int32
     assert len(props2) == new.max()
+
+
+def test_mcit_all_valid_keeps_label_one():
+    """MCIT used np.unique(labels)[1:] as the ids: with no pixel below min_value it dropped label 1 (KeyError)."""
+    yy, xx = np.mgrid[:40, :40]
+    f = 5 + 10 * np.exp(-((yy - 20) ** 2 + (xx - 20) ** 2) / 30)
+    labels = MCIT_Identifier(min_value=0.0, valley_depth=0.5).label(f)
+    assert labels.min() >= 1 and labels.dtype == np.int32
+
+
+def test_enhanced_watershed_rejects_bad_increment():
+    from monte_python.EnhancedWatershedSegmenter import EnhancedWatershed
+    import pytest
+    with pytest.raises(ValueError):
+        EnhancedWatershed(min_thresh=40, max_thresh=65, area_threshold=10, dist_btw_objects=5, data_increment=0)

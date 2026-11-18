@@ -12,7 +12,7 @@ needs_rust = pytest.mark.skipif(not HAS_RUST, reason="monte_python._rust not bui
 
 def two_cells(shape=(80, 120)):
     yy, xx = np.mgrid[:shape[0], :shape[1]]
-    return 62 * np.exp(-((yy - 40) ** 2 + (xx - 40) ** 2) / 300.) + 60 * np.exp(-((yy - 40) ** 2 + (xx - 80) ** 2) / 300.)
+    return 62 * np.exp(-((yy - 40) ** 2 + (xx - 40) ** 2) / 300.) + 60 * np.exp(-((yy - 40) ** 2 + (xx - 72) ** 2) / 300.)
 
 
 @pytest.mark.parametrize("use_rust", [False, True] if HAS_RUST else [False])
@@ -23,7 +23,7 @@ def test_split_two_cells_tiles_the_object(use_rust):
     assert ndimage.label(mask, structure=np.ones((3, 3)))[1] == 1
     assert lab.max() == 2
     np.testing.assert_array_equal(lab > 0, mask)
-    assert lab[40, 40] != lab[40, 80]
+    assert lab[40, 40] != lab[40, 72]
 
 
 def test_small_objects_whole_and_dropped():

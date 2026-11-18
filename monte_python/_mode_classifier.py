@@ -10,7 +10,18 @@ from math import atan2, ceil, pi, log, sqrt, pow, fabs, cos, sin
 from skimage.measure import regionprops, label
 from skimage.measure._regionprops import RegionProperties
 from .object_identification import label
-from .object_quality_control import QualityControler, whereeq
+from .object_quality_control import QualityControler
+
+
+@jit(nopython=True)
+def whereeq(arr, arrind, val, setval):
+    # numba copy: iterate_storm_types (jit) calls it; object_quality_control.whereeq is plain numpy (no numba there)
+    for i in range(arr.shape[0]):
+        for j in range(arr.shape[1]):
+            if arrind[i, j] == val:
+                arr[i, j] = setval
+    return arr
+
 from numba.core.errors import NumbaDeprecationWarning, NumbaPendingDeprecationWarning
 import warnings
 
@@ -204,7 +215,7 @@ def get_constituent_storms(
     dbz_coords = [prop.coords for prop in dbzcomp_props]
     if (len(temp_storm_types)):
         new_storm_types,new_dbzcomp_labels,n_append = iterate_storm_types(
-                        storm_types, new_storm_types, new_dbzcomp_labels,
+                        storm_types, new_storm_types, new_dbzcomp_labels.astype(np.int32),
                         dbz_coords, 
                         [prop.centroid for prop in dbzcomp_props],
                         [prop.equivalent_diameter for prop in dbzcomp_props], 
@@ -725,7 +736,7 @@ def iterate_storm_types(storm_types, new_storm_types, new_dbzcomp_labels,
                     dbz_area.append(prelim_new_dbzcomp_area[nnn])
                     dbz_equiv_diam.append(prelim_new_dbzcomp_equiv_diam[nnn])
                     new_dbzcomp_labels = whereeq(new_dbzcomp_labels.astype(np.int64),temp_dbzcomp_labels.astype(np.int64),
-                    np.int64(prelim_temp_labels[nnn] - label_inc),np.int64(prelim_temp_labels[nnn])).astype(np.int16)
+                    np.int64(prelim_temp_labels[nnn] - label_inc),np.int64(prelim_temp_labels[nnn])).astype(np.int32)
                     
     return new_storm_types, new_dbzcomp_labels, new_inds
 

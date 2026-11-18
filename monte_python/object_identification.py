@@ -733,8 +733,10 @@ class MCIT_Identifier:
         removed_ids = [] #once an id is removed it stays removed
     
         # iterate as long as we find new connections
-        while len(np.unique(labels_arr)[1:]) < old_number_of_ids:
-            ids = np.unique(labels_arr)[1:]
+        # ids are > 0 (-1 = below min_value, 0 = valid but unreached by a marker); `[1:]` dropped
+        # label 1 whenever no pixel was below min_value
+        while len(np.unique(labels_arr[labels_arr > 0])) < old_number_of_ids:
+            ids = np.unique(labels_arr[labels_arr > 0])
             old_number_of_ids = len(ids)
             max_vals = ndi.maximum(input_data, labels=labels_arr, index=ids)
     
@@ -784,20 +786,14 @@ class MCIT_Identifier:
 
 
         #monte python likes "0" not "-1" as no object flag
-        labels_arr[labels_arr == -1] = 0
+        labels_arr[labels_arr < 0] = 0
 
-        #monte python kinda expects the labels to be in order. We can
-        #reindex the space like this
-        # Unique sorted values
-        unique_values = np.unique(labels_arr)
-
-        # Mapping from value to index
-        value_to_index = {val: idx for idx, val in enumerate(unique_values)}
-
-        # Vectorized replacement using numpy
-        vectorized_map = np.vectorize(lambda x: value_to_index[x])
-        labels_arr = vectorized_map(labels_arr)
-
+        # relabel 1..N in sorted order (np.unique inverse; was np.vectorize over a dict)
+        has_background = bool((labels_arr == 0).any())
+        _, inverse = np.unique(labels_arr, return_inverse=True)
+        labels_arr = inverse.reshape(labels_arr.shape).astype(np.int32)
+        if not has_background:
+            labels_arr += 1
         return labels_arr
 
     def _binarize(self, input_data):
@@ -821,7 +817,7 @@ class MCIT_Identifier:
         neighboring_labels = np.unique(labels_arr[border_mask])
     
         #remove the -1 values
-        neighboring_labels = neighboring_labels[~(neighboring_labels == -1)]
+        neighboring_labels = neighboring_labels[neighboring_labels > 0]
     
         return neighboring_labels, border_mask
 

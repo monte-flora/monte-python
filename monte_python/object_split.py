@@ -69,50 +69,56 @@ def split_objects(field, threshold=40.0, min_px=8, split_px=300, min_thresh=None
         labelled (the split pieces tile the object).
     """
     field = np.asarray(field)
+    if field.ndim != 2:
+        raise ValueError('field must be 2-D')
     if min_thresh is None:
         min_thresh = threshold
     with np.errstate(invalid='ignore'):
         mask = np.isfinite(field) & (field >= threshold)
     comp, n = ndimage.label(mask, structure=_EIGHT)
+    out = np.zeros(field.shape, dtype=np.int32)
+    cores = np.zeros(field.shape, dtype=np.int32)
     if n == 0:
-        out = np.zeros(field.shape, dtype=np.int32)
-        return (out, out.copy()) if return_cores else out
-    sizes = np.bincount(comp.ravel(), minlength=n + 1)
+        return (out, cores) if return_cores else out
+    # sparse from here on: only threshold pixels and the bounding boxes of big objects are touched
+    nz = np.flatnonzero(mask)
+    cnz = comp.ravel()[nz]
+    sizes = np.bincount(cnz, minlength=n + 1)
     keep = sizes >= min_px
     keep[0] = False
     big = keep & (sizes > split_px)
-    cores = np.zeros(field.shape, dtype=np.int32)
+    lut = np.zeros(n + 1, dtype=np.int32)          # whole objects: one id each (renumbered below)
+    lut[keep] = np.arange(1, int(keep.sum()) + 1, dtype=np.int32)
+    out.ravel()[nz] = lut[cnz]
+    next_id = int(keep.sum()) + 1
     if big.any():
         ew = EnhancedWatershed(min_thresh=min_thresh, max_thresh=max_thresh, data_increment=data_increment,
                                area_threshold=area_threshold, dist_btw_objects=dist_btw_objects, min_size=min_size,
                                use_rust=use_rust)
         cores = ew.label(field)
-    # cores inside big objects, unique per (object, core) pair
-    in_big = big[comp] & (cores > 0)
-    key = comp[in_big].astype(np.int64) * (int(cores.max()) + 1) + cores[in_big]
-    ukey, inv = np.unique(key, return_inverse=True)
-    core_comp = ukey // (int(cores.max()) + 1)
-    ncores = np.bincount(core_comp, minlength=n + 1)
-    split = big & (ncores >= 2)
-    seeds = np.zeros(field.shape, dtype=np.int32)
-    sel = split[comp[in_big]]
-    rows, cols = np.nonzero(in_big)
-    seeds[rows[sel], cols[sel]] = inv.ravel()[sel].astype(np.int32) + 1
-    grown = grow_labels(seeds, split[comp], use_rust=use_rust)
-    # whole objects (kept, not split) get their own ids after the split pieces
-    whole = keep & ~split
-    offset = int(grown.max())
-    lut = np.zeros(n + 1, dtype=np.int64)
-    lut[whole] = offset + np.arange(1, int(whole.sum()) + 1)
-    out = np.where(grown > 0, grown, lut[comp]).astype(np.int64)
+        slices = ndimage.find_objects(comp)
+        for k in np.flatnonzero(big):
+            sl = slices[k - 1]
+            obj = comp[sl] == k
+            c = np.where(obj, cores[sl], 0)
+            ids = np.unique(c[obj])
+            ids = ids[ids > 0]
+            if ids.size < 2:
+                continue
+            seeds = np.zeros(c.shape, dtype=np.int32)
+            hit = c > 0
+            seeds[hit] = np.searchsorted(ids, c[hit]).astype(np.int32) + 1
+            grown = grow_labels(seeds, obj, use_rust=use_rust)
+            # grown covers obj (every object pixel connects to a core); pieces get fresh ids
+            out[sl][obj] = grown[obj] + (next_id - 1)
+            next_id += ids.size
     # renumber 1..n in row-major order of first pixel
-    flat = out.ravel()
-    nz = np.flatnonzero(flat)
-    if nz.size:
-        vals, first = np.unique(flat[nz], return_index=True)
-        order = np.argsort(first, kind='stable')
-        remap = np.zeros(int(vals.max()) + 1, dtype=np.int32)
-        remap[vals[order]] = np.arange(1, len(vals) + 1, dtype=np.int32)
-        out = remap[out]
-    out = out.astype(np.int32)
+    vals = out.ravel()[nz]
+    used, first = np.unique(vals, return_index=True)
+    if used.size and used[0] == 0:
+        used, first = used[1:], first[1:]
+    order = np.argsort(first, kind='stable')
+    remap = np.zeros(next_id, dtype=np.int32)
+    remap[used[order]] = np.arange(1, used.size + 1, dtype=np.int32)
+    out.ravel()[nz] = remap[vals]
     return (out, cores) if return_cores else out

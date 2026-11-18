@@ -28,7 +28,7 @@ plot = ["matplotlib>=3.5"]
 mcit = ["opencv-python-headless"]
 storm-mode = ["numba", "xarray>=0.21.1"]
 all = ["matplotlib>=3.5", "opencv-python-headless", "numba", "xarray>=0.21.1"]
-test = ["pytest", "psutil"]
+test = ["pytest", "psutil", "netCDF4"]
 
 [project.urls]
 Source = "https://github.com/monte-flora/monte-python"
