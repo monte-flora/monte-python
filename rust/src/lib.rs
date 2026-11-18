@@ -4,6 +4,7 @@ use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
+pub mod tracking;
 pub mod watershed;
 
 fn to_pyarray<'py>(py: Python<'py>, ny: usize, nx: usize, v: Vec<i32>) -> PyResult<Bound<'py, PyArray2<i32>>> {
@@ -56,10 +57,44 @@ fn grow_labels<'py>(py: Python<'py>, labels: PyReadonlyArray2<'py, i32>, mask: P
     to_pyarray(py, ny, nx, out)
 }
 
+/// OverlapTracker(percent_overlap, cap_overlap, mend_tracks, mend_dist): streaming ObjectTracker core.
+/// `.step(labels int32 2-D C-contiguous) -> int32 2-D` track ids (GIL released); `.records()` list of
+/// (frame, track, label, area, cy, cx); `.events()` list of (frame, kind, track, other_track, label).
+#[pyclass(module = "monte_python._rust")]
+struct OverlapTracker {
+    inner: tracking::Tracker,
+}
+
+#[pymethods]
+impl OverlapTracker {
+    #[new]
+    #[pyo3(signature = (percent_overlap=0.0, cap_overlap=false, mend_tracks=true, mend_dist=3.0))]
+    fn new(percent_overlap: f64, cap_overlap: bool, mend_tracks: bool, mend_dist: f64) -> Self {
+        OverlapTracker { inner: tracking::Tracker::new(percent_overlap, cap_overlap, mend_tracks, mend_dist) }
+    }
+
+    fn step<'py>(&mut self, py: Python<'py>, labels: PyReadonlyArray2<'py, i32>) -> PyResult<Bound<'py, PyArray2<i32>>> {
+        let (ny, nx) = (labels.shape()[0], labels.shape()[1]);
+        let l = labels.as_slice().map_err(|_| PyValueError::new_err("labels must be C-contiguous"))?;
+        let inner = &mut self.inner;
+        let out = py.detach(|| inner.step(ny, nx, l)).map_err(PyValueError::new_err)?;
+        to_pyarray(py, ny, nx, out)
+    }
+
+    fn records(&self) -> Vec<tracking::Record> {
+        self.inner.records.clone()
+    }
+
+    fn events(&self) -> Vec<tracking::Event> {
+        self.inner.events.clone()
+    }
+}
+
 #[pymodule]
 fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(enhanced_watershed, m)?)?;
     m.add_function(wrap_pyfunction!(grow_labels, m)?)?;
+    m.add_class::<OverlapTracker>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

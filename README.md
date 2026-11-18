@@ -23,6 +23,11 @@ MontePython can perform matching between two sets of objects (e.g., forecasts an
 
 Once identified, objects over time can be tracked using MontePython's ObjectTracker. The algorithm is designed for high temporal resolution data such that matches in time can be largely determined by the amount of overlap. The tracking algorithm can handle both splits and mergers. To see examples of how to perform object tracking, see the [object tracking tutorial notebook](https://github.com/WarnOnForecast/MontePython/blob/master/tutorial_notebooks/object_tracking.ipynb)
 
+Since v1.3 `ObjectTracker` streams (`step(labels)` / `track_iter(frames)`: two frames in memory, ids final per
+frame; `track()` stacks them), runs on the Rust core when built (`use_rust=None`; numpy otherwise), mends broken
+tracks by default (`mend_tracks=True`, `mend_dist=3` grid points; v1.2 defaulted to False and its mending had no
+effect, so track ids differ from v1.2), and keeps the original 0.5-bounded overlap score as `cap_overlap=True`.
+
 ## Storm Identification and Classification 
 [Potvin et al. (2022)](https://journals.ametsoc.org/view/journals/atot/39/7/JTECH-D-21-0141.1.xml?rskey=dHTUIB&result=5) developed a storm identification and classification method, which is applicable to both convection-allowing model output and observed radar. To see examples of how to use this method , see the [storm mode tutorial notebook](https://github.com/WarnOnForecast/MontePython/blob/master/tutorial_notebooks/storm_mode_classification.ipynb)
 
