@@ -13,12 +13,13 @@
 import numpy as np
 from scipy.ndimage import find_objects
 from collections import OrderedDict
-#import numba
-#from numba.core.errors import NumbaDeprecationWarning, NumbaPendingDeprecationWarning
-#import warnings
 
-#warnings.simplefilter('ignore', category=NumbaDeprecationWarning)
-#warnings.simplefilter('ignore', category=NumbaPendingDeprecationWarning)
+try:  # compiled core (monte_python/_rust, built by maturin); the pure-Python code below is the fallback
+    from . import _rust
+except ImportError:  # pragma: no cover - depends on the build
+    _rust = None
+
+HAS_RUST = _rust is not None
 
 
 class EnhancedWatershed(object):
@@ -32,20 +33,31 @@ class EnhancedWatershed(object):
         data_increment (int): quantization interval. Use 1 if you don't want to quantize
         max_thresh (int): values greater than maxThresh are treated as the maximum threshold
         area_threshold (int): clusters smaller than this threshold are ignored.
-    """
-    
+        dist_btw_objects (int): clearance between local maxima (sets the centre search window).
+        min_size (int): regions of <= min_size pixels are dropped (default 6).
+        use_rust (bool or None): None uses the compiled core when it is installed, True requires it,
+            False forces the pure-Python reference. Both give identical labels.
 
-    def __init__(self, min_thresh, max_thresh, area_threshold, dist_btw_objects, data_increment=1):
+    Non-finite input (NaN, inf) is treated as below ``min_thresh``.
+    """
+
+    def __init__(self, min_thresh, max_thresh, area_threshold, dist_btw_objects, data_increment=1,
+                 min_size=6, use_rust=None):
+        if not data_increment > 0:
+            raise ValueError(f"data_increment must be > 0, got {data_increment}")
         self.min_thresh = min_thresh
         self.data_increment = data_increment
         self.max_thresh = max_thresh
         self.max_size = area_threshold
-        self.min_size = 6
+        self.min_size = min_size
         self.dist_btw_objects = dist_btw_objects
         self.max_bin = int((self.max_thresh - self.min_thresh) / self.data_increment)
         self.UNMARKED = -1
         self.GLOBBED = -3
         self.TOOSMALL = -4
+        if use_rust and not HAS_RUST:
+            raise ImportError("use_rust=True but monte_python._rust is not built (pip install with a Rust toolchain)")
+        self.use_rust = HAS_RUST if use_rust is None else bool(use_rust)
 
     def label(self, input_grid, only_objects=True):
         """
@@ -56,14 +68,29 @@ class EnhancedWatershed(object):
             only_objects (bool): Only return object pixel values on final grid
 
         Returns:
-            Array of labeled pixels
+            Array of labeled pixels (int32)
         """
-        pixels, q_data = self.quantize(input_grid)
-        centers = self.find_local_maxima(pixels, q_data)
-        marked = self.grow_centers(centers, q_data)
+        if self.use_rust:
+            marked = self._label_rust(input_grid)
+        else:
+            pixels, q_data = self.quantize(input_grid)
+            centers = self.find_local_maxima(pixels, q_data)
+            marked = self.grow_centers(centers, q_data)
         if only_objects:
-            marked = np.where(marked > 0, marked, 0)
+            marked = np.asarray(marked, dtype=np.int32)
+            np.maximum(marked, 0, out=marked)
         return marked
+
+    def _label_rust(self, input_grid):
+        grid = np.asarray(input_grid)
+        if grid.dtype not in (np.float32, np.float64):
+            grid = grid.astype(np.float64)
+        grid = np.ascontiguousarray(grid)
+        if grid.ndim != 2:
+            raise ValueError("input_grid must be 2-D")
+        min_infl, max_infl = self._infl_dists()
+        return _rust.enhanced_watershed(grid, float(self.min_thresh), int(self.max_bin), float(self.data_increment),
+                                        int(self.max_size), int(self.min_size), int(min_infl), int(max_infl))
 
     @staticmethod
     def size_filter(labeled_grid, min_size):
@@ -80,14 +107,20 @@ class EnhancedWatershed(object):
         slices = find_objects(labeled_grid)
         j = 1
         for i, s in enumerate(slices):
+            if s is None:
+                continue
             box = labeled_grid[s]
             size = np.count_nonzero(box == i + 1)
             if size >= min_size and box.shape[0] > 1 and box.shape[1] > 1:
-                out_grid[np.where(labeled_grid == i + 1)] = j
+                out_grid[s][box == i + 1] = j
                 j += 1
         return out_grid
 
-    #@numba.jit(fastmath=True, forceobj=True) 
+    def _infl_dists(self):
+        min_infl = int(np.round(1 + 0.5 * np.sqrt(self.dist_btw_objects)))
+        max_infl = 2 * min_infl
+        return min_infl, max_infl
+
     def find_local_maxima(self, pixels, q_data):
         """
         Finds the local maxima in the inputGrid and perform region growing to identify objects.
@@ -96,15 +129,14 @@ class EnhancedWatershed(object):
             pixels: dictionary of quantized pixel values
             q_data: 2D array representation of quantized input data
         Returns:
-            array with labeled objects.
+            dict of bin -> list of centre pixels (row, col), in visit order.
         """
         centers = OrderedDict()
         for p in pixels.keys():
             centers[p] = []
-        marked = np.ones(q_data.shape, dtype=np.int32) * self.UNMARKED
-        MIN_INFL = int(np.round(1 + 0.5 * np.sqrt(self.dist_btw_objects)))
-        MAX_INFL = 2 * MIN_INFL
-        marked_so_far = []
+        marked = np.full(q_data.shape, self.UNMARKED, dtype=np.int32)
+        ny, nx = q_data.shape
+        MIN_INFL, MAX_INFL = self._infl_dists()
         # Find the maxima. These are high-values with enough clearance
         # around them.
         # Work from high to low bins. The pixels in the highest bin mark their
@@ -115,46 +147,28 @@ class EnhancedWatershed(object):
             infl_dist = MIN_INFL + int(np.round(float(b) / self.max_bin * (MAX_INFL - MIN_INFL)))
             for p in pixels[b]:
                 if marked[p] == self.UNMARKED:
-                    ok = False
-                    del marked_so_far[:]
-                    # Temporarily mark unmarked points in square around point (keep track of them in list
-                    # marked_so_far).
-                    # If none of the points in square were marked already from a higher intensity center, 
-                    # this counts as a new center and ok=True and points will remain marked.
-                    # Otherwise ok=False and marked points that were previously unmarked will be unmarked.
-                    for (i, j), v in np.ndenumerate(marked[p[0] - infl_dist:p[0] + infl_dist + 1,
-                                                    p[1] - infl_dist:p[1] + infl_dist + 1]):
-                        if v == self.UNMARKED:
-                            ok = True
-                            marked[i - infl_dist + p[0], j - infl_dist + p[1]] = b
-
-                            marked_so_far.append((i - infl_dist + p[0], j - infl_dist + p[1]))
-                        else:
-                            # neighborhood already taken
-                            ok = False
-                            break
-                    # ok if point and surrounding square were not marked already.
-                    if ok:
-                        # highest point in its neighborhood
+                    # A new centre if no pixel in the square around it (clipped to the grid) was marked already
+                    # by a higher-intensity centre; the square is then marked with this bin. (The original loop
+                    # marked pixels one by one and reverted on the first marked one: same result.)
+                    win = marked[max(p[0] - infl_dist, 0):min(p[0] + infl_dist + 1, ny),
+                                 max(p[1] - infl_dist, 0):min(p[1] + infl_dist + 1, nx)]
+                    if (win == self.UNMARKED).all():
+                        win[...] = b
                         centers[b].append(p)
-                    else:
-                        for m in marked_so_far:
-                            marked[m] = self.UNMARKED
         return centers
 
-    #@numba.jit(fastmath=True, forceobj=True)
     def grow_centers(self, centers, q_data):
         """
-        Once
+        Grow regions from the centres, bin by bin from high to low.
 
         Args:
-            centers:
-            q_data:
+            centers: dict of bin -> list of centre pixels (from find_local_maxima)
+            q_data: quantized data
 
         Returns:
-
+            int32 grid: object labels (> 0), UNMARKED (-1) and GLOBBED (-3) pixels
         """
-        marked = np.ones(q_data.shape, dtype=np.int32) * self.UNMARKED
+        marked = np.full(q_data.shape, self.UNMARKED, dtype=np.int32)
         deferred_from_last = []
         deferred_to_next = []
         center_keys = np.array(list(centers.keys()))[::-1]
@@ -188,8 +202,15 @@ class EnhancedWatershed(object):
         del deferred_from_last[:]
         del deferred_to_next[:]
         return marked
-    
-    #@numba.jit(fastmath=True, forceobj=True)
+
+    @staticmethod
+    def _neighbours(p, shape):
+        """3x3 neighbourhood of p (row-major, p included), clipped to the grid."""
+        ny, nx = shape
+        for i in range(max(p[0] - 1, 0), min(p[0] + 2, ny)):
+            for j in range(max(p[1] - 1, 0), min(p[1] + 2, nx)):
+                yield (i, j)
+
     def set_maximum(self, q_data, marked, center, bin_lower, foothills, capture_index):
         """
         Grow a region at a certain bin level and check if the region has reached the maximum size.
@@ -212,6 +233,7 @@ class EnhancedWatershed(object):
         will_be_considered_again = False
         as_bin.append(center)
         center_data = q_data[center]
+        shape = q_data.shape
         while len(as_bin) > 0:
             p = as_bin.pop(-1)  # remove and return last pixel in as_bin
             if marked[p] != self.UNMARKED:  # already processed
@@ -220,10 +242,9 @@ class EnhancedWatershed(object):
             marked_so_far.append(p)
 
             # check neighbors
-            for index, val in np.ndenumerate(marked[p[0] - 1:p[0] + 2, p[1] - 1:p[1] + 2]):
+            for pixel in self._neighbours(p, shape):
                 # is neighbor part of peak or part of mountain?
-                if val == self.UNMARKED:
-                    pixel = (index[0] - 1 + p[0], index[1] - 1 + p[1])
+                if marked[pixel] == self.UNMARKED:
                     p_data = q_data[pixel]
                     if (not will_be_considered_again) and (p_data >= 0) and (p_data < center_data):
                         will_be_considered_again = True
@@ -238,11 +259,11 @@ class EnhancedWatershed(object):
         if big_enough:
             # remove lower values within region of influence
             foothills.append((center, as_glob))
-        
+
         elif len(marked_so_far) <= self.min_size:
             for m in marked_so_far:
-                marked[m] = self.UNMARKED  
-        
+                marked[m] = self.UNMARKED
+
         elif will_be_considered_again:  # remove the check if you want to ignore regions smaller than max_size
             for m in marked_so_far:
                 marked[m] = self.UNMARKED
@@ -251,7 +272,6 @@ class EnhancedWatershed(object):
             del marked_so_far[:]
         return big_enough or (not will_be_considered_again)
 
-    #@numba.jit(fastmath=True, forceobj=True)
     def remove_foothills(self, q_data, marked, bin_num, bin_lower, centers, foothills):
         """
         Mark points determined to be foothills as globbed, so that they are not included in
@@ -267,6 +287,7 @@ class EnhancedWatershed(object):
             foothills: List of foothill points being removed.
         """
         hills = []
+        shape = q_data.shape
         for foot in foothills:
             center = foot[0]
             hills[:] = foot[1][:]
@@ -275,10 +296,9 @@ class EnhancedWatershed(object):
                 # mark this point
                 pt = hills.pop(-1)
                 marked[pt] = self.GLOBBED
-                for s_index, val in np.ndenumerate(marked[pt[0] - 1:pt[0] + 2, pt[1] - 1:pt[1] + 2]):
-                    index = (s_index[0] - 1 + pt[0], s_index[1] - 1 + pt[1])
+                for index in self._neighbours(pt, shape):
                     # is neighbor part of peak or part of mountain?
-                    if val == self.UNMARKED:
+                    if marked[index] == self.UNMARKED:
                         # will let in even minor peaks
                         if (q_data[index] >= 0) and \
                                 (q_data[index] < bin_lower) and \
@@ -289,19 +309,20 @@ class EnhancedWatershed(object):
     @staticmethod
     def is_closest(point, center, centers, bin_num):
         bin_thresh = int(bin_num / 2)
-        p_arr = np.array(point)
-        c_arr = np.array(center)
-        my_dist = np.sum(np.power(p_arr - c_arr, 2))
+        py, px = int(point[0]), int(point[1])
+        my_dist = (py - int(center[0])) ** 2 + (px - int(center[1])) ** 2
         for o_bin in range(bin_thresh, len(centers.keys())):
             for c in centers[o_bin]:
-                oc_arr = np.array(c)
-                if np.sum(np.power(p_arr - oc_arr, 2)) < my_dist:
+                if (py - int(c[0])) ** 2 + (px - int(c[1])) ** 2 < my_dist:
                     return False
         return True
 
     def quantize(self, input_grid):
         """
         Quantize a grid into discrete steps based on input parameters.
+
+        Bins: ``floor((trunc(x) - min_thresh) / data_increment)`` clipped to ``max_bin`` (the original int32-cast
+        rule); bins < 0 (and bin 0 when ``min_thresh == 0``) and non-finite values are -1 (not a candidate).
 
         Args:
             input_grid: 2-d array of values
@@ -313,16 +334,25 @@ class EnhancedWatershed(object):
         for i in range(self.max_bin + 1):
             pixels[i] = []
 
-        data = (np.array(input_grid, dtype=np.int32) - self.min_thresh) // self.data_increment
+        q_data = self.quantize_grid(input_grid)
+        good_points = np.nonzero(q_data >= 0)
+        for i, j in zip(*good_points):
+            pixels[int(q_data[i, j])].append((int(i), int(j)))
+        return pixels, q_data
+
+    def quantize_grid(self, input_grid):
+        """The quantized int32 grid (see `quantize`)."""
+        grid = np.asarray(input_grid, dtype=np.float64)
+        finite = np.isfinite(grid)
+        with np.errstate(invalid='ignore'):
+            data = np.floor_divide(np.trunc(np.where(finite, grid, 0.0)) - self.min_thresh, self.data_increment)
         if self.min_thresh == 0:
-            data[data <= 0] = -1
+            bad = data <= 0
         else:
-            data[data < 0] = -1 
-        data[data > self.max_bin] = self.max_bin
-        good_points = np.where(data >= 0)
-        for g in np.arange(good_points[0].shape[0]):
-            pixels[data[(good_points[0][g], good_points[1][g])]].append((good_points[0][g], good_points[1][g]))
-        return pixels, data
+            bad = data < 0
+        data = np.minimum(data, self.max_bin)
+        data[bad | ~finite] = -1
+        return data.astype(np.int32)
 
     @staticmethod
     def is_valid(point, shape):

@@ -1,48 +1,77 @@
-import scipy
 import numpy as np
-import skimage.measure
-from math import sqrt
 from collections import OrderedDict
-from skimage.measure import regionprops 
-from numba import jit
-from numba_kdtree import KDTree
-#import warnings
-#warnings.simplefilter("ignore", UserWarning)
-
-@jit(fastmath=True, parallel=False)  
-def loop_label_merge(region_tree,
-                     original_labels,
-                     remaining_labels, 
-                     label,
-                     qc_object_labels, 
-                     merge_thresh):
-    
-    for other_label in original_labels:
-        if other_label != label and other_label in remaining_labels: 
-            y_idx, x_idx = np.where( qc_object_labels == other_label)
-            xrav = x_idx.ravel()
-            yrav = y_idx.ravel()
-            other_label_xy_stack = np.dstack((xrav,yrav))[0]
-            
-            results = region_tree.query(other_label_xy_stack)
-            # Depending on the numba_kdtree version, the number of returns is different!
-            # The newer versions return 3 items
-            dist_btw_objects = results[0]
-            
-            if round(np.amin(dist_btw_objects), 2) <= merge_thresh: 
-                qc_object_labels = whereeq(qc_object_labels, qc_object_labels, other_label, label)
-                remaining_labels = np.unique(qc_object_labels)[1:]
-                        
-    return qc_object_labels, remaining_labels
+from scipy.spatial import cKDTree
+from skimage.measure import regionprops
 
 
-@jit(fastmath=True,parallel=False) 
-def whereeq(arr,arrind,val,setval):
-    for i in np.arange(arr.shape[0]):
-        for j in np.arange(arr.shape[1]):
-            if arrind[i,j]==val:
-                arr[i,j] = setval
+def whereeq(arr, arrind, val, setval):
+    """arr[arrind == val] = setval (in place; returns arr). Kept for callers of the old numba helper."""
+    arr[arrind == val] = setval
     return arr
+
+
+def _relabel(object_labels, kept_labels):
+    """int32 grid with kept_labels (in order) renumbered 1..n and everything else 0, in one O(N) pass."""
+    object_labels = np.asarray(object_labels)
+    kept_labels = np.asarray(kept_labels, dtype=np.int64)
+    top = int(object_labels.max()) if object_labels.size else 0
+    lut = np.zeros(max(top, int(kept_labels.max()) if kept_labels.size else 0) + 1, dtype=np.int32)
+    lut[kept_labels] = np.arange(1, len(kept_labels) + 1, dtype=np.int32)
+    return lut[np.clip(object_labels, 0, None).astype(np.int64)]
+
+
+def _boundary_pixels(labels):
+    """(rows, cols, labels) of labelled pixels with a 4-neighbour of another value. The closest pixel pair of two
+    disjoint objects is always a boundary pair, so merging distances need only these."""
+    lab = np.asarray(labels)
+    pad = np.pad(lab, 1, mode='constant', constant_values=0)
+    c = pad[1:-1, 1:-1]
+    edge = (c != pad[:-2, 1:-1]) | (c != pad[2:, 1:-1]) | (c != pad[1:-1, :-2]) | (c != pad[1:-1, 2:])
+    rows, cols = np.nonzero(edge & (c > 0))
+    return rows, cols, lab[rows, cols]
+
+
+def merge_labels(object_labels, merge_thresh):
+    """Merge objects closer than merge_thresh (grid points; distances rounded to 2 decimals, as before).
+
+    Same result as the old sequential loop: labels are visited in increasing order; a still-existing label L
+    absorbs every other still-existing object (with what it absorbed earlier) that has a member within
+    merge_thresh of L's own pixels. Labels are then renumbered 1..n in order of the surviving label values.
+    """
+    labels = np.asarray(object_labels)
+    originals = [int(v) for v in np.unique(labels) if v > 0]
+    if not originals:
+        return np.zeros(labels.shape, dtype=np.int32)
+    rows, cols, labs = _boundary_pixels(labels)
+    near = {k: set() for k in originals}
+    if len(rows) > 1:
+        tree = cKDTree(np.c_[rows, cols])
+        pairs = tree.query_pairs(r=float(merge_thresh) + 0.01, output_type='ndarray')
+        if len(pairs):
+            a, b = pairs[:, 0], pairs[:, 1]
+            diff = labs[a] != labs[b]
+            a, b = a[diff], b[diff]
+            d = np.hypot(rows[a] - rows[b], cols[a] - cols[b])
+            ok = np.round(d, 2) <= merge_thresh
+            for la, lb in zip(labs[a][ok].tolist(), labs[b][ok].tolist()):
+                near[la].add(lb)
+                near[lb].add(la)
+    owner = {k: k for k in originals}          # original label -> current label value
+    members = {k: [k] for k in originals}      # current label value -> original labels
+    for L in originals:
+        if owner[L] != L:                      # L was absorbed earlier
+            continue
+        for O in sorted({owner[m] for m in near[L]} - {L}):
+            for m in members[O]:
+                owner[m] = L
+            members[L].extend(members.pop(O))
+    survivors = sorted(members)
+    lut = np.zeros(max(originals) + 1, dtype=np.int32)
+    rank = {rep: i + 1 for i, rep in enumerate(survivors)}
+    for k in originals:
+        lut[k] = rank[owner[k]]
+    return lut[np.clip(labels, 0, None).astype(np.int64)]
+
 
 class QualityControler:
     '''
@@ -125,12 +154,8 @@ class QualityControler:
             : object_labels_and_props, 2-tuple of 2D np array of object labels and the associated regionprops object 
             : min_area, int, minimum area (in number of grid points) of an object
         '''
-        qc_object_labels = np.zeros( self.object_labels.shape, dtype=np.int16) 
-        j = 1
-        for region in self.object_properties:
-             if region.area >= self.qc_params['min_area']:
-                 qc_object_labels[self.object_labels == region.label] = j 
-                 j+=1
+        kept = [region.label for region in self.object_properties if region.area >= self.qc_params['min_area']]
+        qc_object_labels = _relabel(self.object_labels, kept)
         qc_object_properties = regionprops( qc_object_labels, self.input_data,  ) 
         
         self.object_labels = qc_object_labels
@@ -145,13 +170,10 @@ class QualityControler:
             : object_labels_and_props, 2-tuple of 2D np array of object labels and the associated regionprops object 
             : max_length, int, maximum object length (in grid point distances) 
         '''
-        qc_object_labels = np.zeros(self.object_labels.shape, dtype=np.int16)
-        j=1
-        for region in self.object_properties:
-            # If the object is shorter than the length, keep it.
-             if round(region.major_axis_length, 2) <= self.qc_params['max_length']:
-                 qc_object_labels[self.object_labels == region.label] = j
-                 j+=1
+        # If the object is shorter than the length, keep it.
+        kept = [region.label for region in self.object_properties
+                if round(region.major_axis_length, 2) <= self.qc_params['max_length']]
+        qc_object_labels = _relabel(self.object_labels, kept)
         qc_object_properties = regionprops( qc_object_labels, self.input_data,  )
 
         self.object_labels = qc_object_labels
@@ -166,15 +188,11 @@ class QualityControler:
             : object_labels_and_props, 2-tuple of 2D np array of object labels and the associated regionprops object 
             : max_thresh, float, intensity threshold for the 75th percentile
         '''
-        qc_object_labels = np.zeros( self.object_labels.shape, dtype=np.int16)
-        j=1
         val, P = self.qc_params['max_thresh']
-        for region in self.object_properties: 
-             if round( np.percentile(self.input_data[self.object_labels == region.label], P), 10) \
-                 >= round(val,10): 
-                 qc_object_labels[self.object_labels == region.label] = j
-                 j+=1
-        
+        data = np.asarray(self.input_data)
+        kept = [region.label for region in self.object_properties
+                if round(np.percentile(data[region.coords[:, 0], region.coords[:, 1]], P), 10) >= round(val, 10)]
+        qc_object_labels = _relabel(self.object_labels, kept)
         qc_object_properties = regionprops( qc_object_labels, self.input_data, )
 
         self.object_labels = qc_object_labels
@@ -190,15 +208,11 @@ class QualityControler:
             : min_time, int, minimum duration (in terms of number of time steps) 
             : time_argmax_idxs, When applying np.argmax over time dimensions of an array
         '''
-        qc_object_labels = np.zeros( self.object_labels.shape, dtype=np.int16)
-        j=1
-        time_argmax_idxs = self.qc_params['min_time'][1]
-        for region in self.object_properties:     
-             duration = len( np.unique( time_argmax_idxs[self.object_labels == region.label] ))  
-             if duration >= self.qc_params['min_time'][0]:
-                 qc_object_labels[self.object_labels == region.label] = j
-                 j+=1
-
+        time_argmax_idxs = np.asarray(self.qc_params['min_time'][1])
+        kept = [region.label for region in self.object_properties
+                if len(np.unique(time_argmax_idxs[region.coords[:, 0], region.coords[:, 1]]))
+                >= self.qc_params['min_time'][0]]
+        qc_object_labels = _relabel(self.object_labels, kept)
         qc_object_properties = regionprops( qc_object_labels, self.input_data, )        
         
         self.object_labels = qc_object_labels
@@ -212,14 +226,17 @@ class QualityControler:
         : trim , 2-tuple of maximum intensity and minimum intensity thresholds
        
         """
-        qc_object_labels = np.copy(self.object_labels)
-    
+        qc_object_labels = np.array(self.object_labels, dtype=np.int32)
+        data = np.asarray(self.input_data)
+
         max_thresh = self.qc_params['trim'][0]
         bdry_thresh = self.qc_params['trim'][1]
-        
+
         for region in self.object_properties:
             if region.intensity_max >= max_thresh:
-                qc_object_labels[(qc_object_labels==region.label)&(self.input_data<=bdry_thresh)]=0
+                r, c = region.coords[:, 0], region.coords[:, 1]
+                low = data[r, c] <= bdry_thresh
+                qc_object_labels[r[low], c[low]] = 0
     
         qc_object_properties = regionprops(qc_object_labels, self.input_data)
     
@@ -232,9 +249,9 @@ class QualityControler:
         maximum area threshold is exceeded"""
         
         max_area = self.qc_params['max_area_before_split']
-        qc_object_labels = np.zeros(self.object_labels.shape, dtype=np.int16)
-    
-        c = 1 
+        qc_object_labels = np.zeros(self.object_labels.shape, dtype=np.int32)
+
+        c = 1
         for region in self.object_properties:
             if region.area >= max_area:
                 # Get the region's center
@@ -251,13 +268,12 @@ class QualityControler:
                     else:
                         qc_object_labels[j,i] = c+1
 
-                obj1_area = np.sum(np.where(qc_object_labels==c,1,0))
-                obj2_area = np.sum(np.where(qc_object_labels==c+1,1,0))  
-                # Check that the area has been divided with no loss area!                    
-                assert obj1_area + obj2_area == region.area                   
+                # Check that the area has been divided with no loss area!
+                vals = qc_object_labels[region.coords[:, 0], region.coords[:, 1]]
+                assert np.count_nonzero((vals == c) | (vals == c + 1)) == region.area
                 c+=2
             else:
-                qc_object_labels[self.object_labels==region.label] = c 
+                qc_object_labels[region.coords[:, 0], region.coords[:, 1]] = c
                 c+=1
 
         qc_object_properties = regionprops(qc_object_labels, self.input_data) 
@@ -276,29 +292,7 @@ class QualityControler:
             : merge_thresh, float, merging distance (objects closer than the merging distance 
                                    are combined together; in grid point distance)
         '''
-        qc_object_labels = np.copy( self.object_labels ) 
-        original_labels = np.unique(qc_object_labels)[1:] #[label for label in np.unique(qc_object_labels)[1:]]
-        remaining_labels = np.unique(qc_object_labels)[1:]  #[label for label in np.unique(qc_object_labels)[1:]]
-        for label in original_labels:
-            # Does 'label' still exist? 
-            if int(label) in remaining_labels:
-                y_idx, x_idx = np.where( qc_object_labels == label )
-                label_xy_stack = np.dstack([x_idx.ravel(), y_idx.ravel()])[0]
-                region_tree = KDTree( label_xy_stack )
-                #qc_object_labels, remaining_labels = loop_label_merge(
-                #region_tree, original_labels.astype(np.int32), remaining_labels.astype(np.int32), np.int32(label), 
-                #qc_object_labels.astype(np.int32), np.int32(self.qc_params['merge_thresh'])
-                #)
-                
-                qc_object_labels, remaining_labels = loop_label_merge(
-                region_tree, original_labels, remaining_labels, label, 
-                qc_object_labels, self.qc_params['merge_thresh']
-                )
-                
-                            
-        remaining_labels = np.unique(qc_object_labels)[1:]
-        for i, label in enumerate(remaining_labels):
-            qc_object_labels[qc_object_labels==label] = int(i+1) 
+        qc_object_labels = merge_labels(self.object_labels, self.qc_params['merge_thresh'])
 
         qc_object_properties = regionprops( qc_object_labels, self.input_data, )
         self.object_labels = qc_object_labels
@@ -308,15 +302,16 @@ class QualityControler:
         '''
         Removes objects unmatched to Local Storm Reports (LSRs).
         '''
-        qc_object_labels = np.zeros( self.object_labels.shape, dtype=np.int16)
-        j=1
+        lsr_points = np.atleast_2d(np.asarray(self.qc_params['match_to_lsr']['lsr_points'], dtype=float))
+        kept = []
         for region in self.object_properties:
-            kdbelled_points, labelled_datatree = spatial.cKDTree( region.coords )
-            dist_btw_region_and_lsr, _ = kdtree.query( self.qc_params['match_to_lsr']['lsr_points'] )
-            if round( np.amin( dist_btw_region_and_lsr ), 10) < self.qc_params['match_to_lsr']['dist_to_lsr']:
-                qc_object_labels[self.object_labels == region.label] = j
-                j+=1
-            
+            if len(lsr_points) == 0:
+                break
+            dist_btw_region_and_lsr, _ = cKDTree(region.coords).query(lsr_points)
+            if round(np.amin(dist_btw_region_and_lsr), 10) < self.qc_params['match_to_lsr']['dist_to_lsr']:
+                kept.append(region.label)
+        qc_object_labels = _relabel(self.object_labels, kept)
+
         qc_object_properties = regionprops( qc_object_labels, self.input_data, )
         self.object_labels = qc_object_labels
         self.object_properties = qc_object_properties
