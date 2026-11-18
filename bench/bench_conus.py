@@ -3,12 +3,17 @@ streaming-tracker day (144 frames at 10 min) with peak RSS.
 
     python bench/bench_conus.py ew  [ncells]          # one frame: Rust / Python timing + label equality
     python bench/bench_conus.py day [ncells] [nfr]    # split_objects + StreamingTracker over nfr frames
+    python bench/bench_conus.py trk ncells nfr WHICH  # one tracker over a day of split_objects frames; WHICH:
+        ot-rust | ot-python (ObjectTracker streaming, mending on) | streaming (StreamingTracker) | none |
+        ot-rust-m15g3 (ObjectTracker mend_dist 15, mend_gap 3: the MRMS-scaled mending)
+        td1071 (twc-severe-wx TD-1071 track.py Tracker; path in $TD1071_TRACK)
 """
 import resource
 import sys
 import time
 
 import numpy as np
+import pandas as pd
 
 import monte_python
 from monte_python.EnhancedWatershedSegmenter import EnhancedWatershed
@@ -92,10 +97,57 @@ def bench_day(ncells, nfr):
     print(f"maxrss MB {rss_mb():.0f} (after first frame setup {base:.0f})")
 
 
+def bench_trk(ncells, nfr, which):
+    sc = Scene(ncells)
+    if which == "ot-rust":
+        tr = monte_python.ObjectTracker(use_rust=True)
+    elif which == "ot-rust-m15g3":
+        tr = monte_python.ObjectTracker(use_rust=True, mend_dist=15, mend_gap=3)
+    elif which == "ot-python":
+        tr = monte_python.ObjectTracker(use_rust=False)
+    elif which == "streaming":
+        tr = monte_python.StreamingTracker()
+    elif which == "td1071":
+        import importlib.util
+        import os
+        spec = importlib.util.spec_from_file_location("td1071_track", os.environ["TD1071_TRACK"])
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        tr = mod.Tracker(V=1)
+    else:
+        tr = None
+    ts = []
+    base = None
+    for k in range(nfr):
+        lab = split_objects(sc.frame(k % 48), threshold=40, split_px=300,
+                            **{k2: v for k2, v in EW.items() if k2 != 'min_thresh'})
+        if base is None:
+            base = rss_mb()
+        if tr is not None:
+            t = time.perf_counter()
+            if which == "td1071":
+                idx = np.flatnonzero(lab > 0)
+                tr.step(k, idx, lab.ravel()[idx].astype(np.int64), lab)
+            else:
+                tr.step(lab)
+            ts.append(time.perf_counter() - t)
+    ts = np.array(ts) if ts else np.zeros(1)
+    if which == "td1071":
+        tab = pd.DataFrame(tr.log, columns=["frame", "track", "area", "cy", "cx"])
+    else:
+        tab = tr.table() if tr is not None else pd.DataFrame({"track": []})
+    n, ntrk = len(tab), tab["track"].nunique()
+    print(f"{which}: frames {nfr} track s/frame p50 {np.median(ts):.3f} p90 {np.percentile(ts, 90):.3f} "
+          f"p99 {np.percentile(ts, 99):.3f} max {ts.max():.3f} total {ts.sum():.1f} s  records {n} tracks {ntrk}  "
+          f"maxrss MB {rss_mb():.0f} (after frame 0 {base:.0f})")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1]
     nc = int(sys.argv[2]) if len(sys.argv) > 2 else 400
     if mode == "ew":
         bench_ew(nc, python_ref=len(sys.argv) <= 3 or sys.argv[3] != "norefs")
+    elif mode == "trk":
+        bench_trk(nc, int(sys.argv[3]), sys.argv[4])
     else:
         bench_day(nc, int(sys.argv[3]) if len(sys.argv) > 3 else 144)
