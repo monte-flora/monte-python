@@ -52,3 +52,14 @@ def test_grow_labels_rust_equals_python(seed):
     pts = rng.integers(0, 60, 15), rng.integers(0, 80, 15)
     seeds[pts] = np.arange(1, 16)
     np.testing.assert_array_equal(grow_labels(seeds, mask, use_rust=True), grow_labels(seeds, mask, use_rust=False))
+
+
+def test_core_field_smoothed():
+    """Cores from a smoothed copy: the footprint is still field >= threshold, and split pieces still tile it."""
+    f = two_cells()
+    lab = split_objects(f, threshold=40, split_px=300, area_threshold=50, dist_btw_objects=15,
+                        core_field=ndimage.gaussian_filter(f, 2))
+    np.testing.assert_array_equal(lab > 0, f >= 40)
+    assert lab.max() == 2
+    with pytest.raises(ValueError):
+        split_objects(f, core_field=f[:10])

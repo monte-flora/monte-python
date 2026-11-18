@@ -48,7 +48,7 @@ def grow_labels(labels, mask, use_rust=None):
 
 def split_objects(field, threshold=40.0, min_px=8, split_px=300, min_thresh=None, max_thresh=65.0,
                   data_increment=1.0, area_threshold=100, dist_btw_objects=15, min_size=6, use_rust=None,
-                  return_cores=False):
+                  return_cores=False, core_field=None):
     """
     Threshold objects split into cells by the EnhancedWatershed.
 
@@ -62,6 +62,8 @@ def split_objects(field, threshold=40.0, min_px=8, split_px=300, min_thresh=None
         EnhancedWatershed parameters (``min_thresh`` defaults to ``threshold``).
     use_rust : None (compiled core if built), True or False.
     return_cores : also return the watershed core labels (int32).
+    core_field : optional 2-D array (same shape) the EnhancedWatershed cores are found on, e.g. a smoothed
+        ``field``; objects and their footprints still come from ``field``. Default: ``field``.
 
     Returns
     -------
@@ -71,6 +73,8 @@ def split_objects(field, threshold=40.0, min_px=8, split_px=300, min_thresh=None
     field = np.asarray(field)
     if field.ndim != 2:
         raise ValueError('field must be 2-D')
+    if core_field is not None and np.shape(core_field) != field.shape:
+        raise ValueError('core_field must have the shape of field')
     if min_thresh is None:
         min_thresh = threshold
     with np.errstate(invalid='ignore'):
@@ -95,7 +99,7 @@ def split_objects(field, threshold=40.0, min_px=8, split_px=300, min_thresh=None
         ew = EnhancedWatershed(min_thresh=min_thresh, max_thresh=max_thresh, data_increment=data_increment,
                                area_threshold=area_threshold, dist_btw_objects=dist_btw_objects, min_size=min_size,
                                use_rust=use_rust)
-        cores = ew.label(field)
+        cores = ew.label(field if core_field is None else np.asarray(core_field))
         slices = ndimage.find_objects(comp)
         for k in np.flatnonzero(big):
             sl = slices[k - 1]
