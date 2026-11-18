@@ -4,9 +4,9 @@
 //! Per frame t (> 0): overlap pairs with frame t - 1 are scored k n / (|A| + |B|) (k = 1 with the original 0.5
 //! cap, else 2 = Dice), kept if > `percent_overlap`, ranked by score (ties: previous pre-mend track id, then
 //! label, ascending) and matched greedily one-to-one. Unmatched objects start tracks (pre-mend ids in label
-//! order). With mending, tracks of frame t - 1 not continued, in id order, take the nearest unclaimed new track
-//! whose start centroid is within `mend_dist` of their end centroid + mean motion (truncated centroids, row and
-//! column); output ids follow mend chains to their root. Memory: two index frames and the active tracks.
+//! order). With mending, unmended tracks that ended at frame t - g (g = 1 .. `mend_gap`), in (g, id) order, take
+//! the nearest unclaimed new track whose start centroid is within `mend_dist` of their end centroid + g x mean
+//! motion (truncated centroids, row and column); output ids follow mend chains to their root. Memory: two index frames and the active tracks.
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
@@ -27,6 +27,8 @@ pub struct Tracker {
     k: f64,
     mend: bool,
     mend_dist: f64,
+    mend_gap: i64,
+    dormant: Vec<(i64, i64)>, // (end frame, pre-mend id): ended, unmended tracks within mend_gap
     frame: i64,
     shape: Option<(usize, usize)>,
     prev_idx: Vec<u32>, // per pixel: 0 or 1 + object index of the previous frame
@@ -80,12 +82,14 @@ fn index_labels(labels: &[i32]) -> (Vec<i32>, Vec<u32>) {
 }
 
 impl Tracker {
-    pub fn new(percent_overlap: f64, cap_overlap: bool, mend_tracks: bool, mend_dist: f64) -> Self {
+    pub fn new(percent_overlap: f64, cap_overlap: bool, mend_tracks: bool, mend_dist: f64, mend_gap: i64) -> Self {
         Tracker {
             po: percent_overlap,
             k: if cap_overlap { 1.0 } else { 2.0 },
             mend: mend_tracks,
             mend_dist,
+            mend_gap: mend_gap.max(1),
+            dormant: Vec::new(),
             frame: -1,
             shape: None,
             prev_idx: Vec::new(),
@@ -169,16 +173,22 @@ impl Tracker {
             let mut ended: Vec<i64> = self.prev_pid.iter().copied().filter(|p| cont.binary_search(p).is_err())
                 .collect();
             ended.sort_unstable();
-            if self.mend && !new.is_empty() && !ended.is_empty() {
+            if self.mend {
+                self.dormant.extend(ended.iter().map(|&l| (t - 1, l)));
+                self.dormant.sort_unstable_by(|p, q| q.0.cmp(&p.0).then(p.1.cmp(&q.1)));
+            }
+            let mut mended: Vec<i64> = Vec::new();
+            if self.mend && !new.is_empty() && !self.dormant.is_empty() {
                 let mut taken = vec![false; new.len()];
-                for &l in &ended {
+                for &(end, l) in &self.dormant {
+                    let g = (t - end) as f64;
                     let d = self.trk[&l];
                     let (dx, dy) = if d.n > 1 {
                         ((d.x1 - d.x0) as f64 / (d.n - 1) as f64, (d.y1 - d.y0) as f64 / (d.n - 1) as f64)
                     } else {
                         (0.0, 0.0)
                     };
-                    let (xp, yp) = (d.x1 as f64 + dx, d.y1 as f64 + dy);
+                    let (xp, yp) = (d.x1 as f64 + g * dx, d.y1 as f64 + g * dy);
                     let mut best: Option<(usize, f64)> = None;
                     for (i, &b) in new.iter().enumerate() {
                         if taken[i] {
@@ -192,6 +202,7 @@ impl Tracker {
                     }
                     if let Some((i, _)) = best {
                         taken[i] = true;
+                        mended.push(l);
                         let s = pid[new[i]];
                         self.trk.get_mut(&s).unwrap().root = d.root;
                         self.events.push((t, "mend", d.root, 0, lab[new[i]]));
@@ -209,9 +220,19 @@ impl Tracker {
                     self.events.push((t, "merge", self.trk[&ap].root, self.trk[&bp].root, lab[b]));
                 }
             }
-            for l in &ended {
-                self.trk.remove(l);
+            if !self.mend {
+                for l in &ended {
+                    self.trk.remove(l);
+                }
             }
+            let (gap, trk) = (self.mend_gap, &mut self.trk);
+            self.dormant.retain(|&(end, l)| {
+                let keep = !mended.contains(&l) && t - end < gap; // else mended or too old for t + 1
+                if !keep {
+                    trk.remove(&l);
+                }
+                keep
+            });
         }
         let mut out = vec![0i32; nobj + 1];
         for b in 0..nobj {
@@ -246,7 +267,7 @@ mod tests {
 
     #[test]
     fn overlap_continues_and_mend_joins() {
-        let mut t = Tracker::new(0.0, false, true, 5.0);
+        let mut t = Tracker::new(0.0, false, true, 5.0, 1);
         let a = t.step(20, 40, &boxf(20, 40, 5, 5, 7)).unwrap();
         let b = t.step(20, 40, &boxf(20, 40, 5, 6, 3)).unwrap(); // overlaps: same track
         assert_eq!(a.iter().max(), Some(&1));

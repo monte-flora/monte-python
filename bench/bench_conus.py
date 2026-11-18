@@ -5,6 +5,7 @@ streaming-tracker day (144 frames at 10 min) with peak RSS.
     python bench/bench_conus.py day [ncells] [nfr]    # split_objects + StreamingTracker over nfr frames
     python bench/bench_conus.py trk ncells nfr WHICH  # one tracker over a day of split_objects frames; WHICH:
         ot-rust | ot-python (ObjectTracker streaming, mending on) | streaming (StreamingTracker) | none |
+        ot-rust-m15g3 (ObjectTracker mend_dist 15, mend_gap 3: the MRMS-scaled mending)
         td1071 (twc-severe-wx TD-1071 track.py Tracker; path in $TD1071_TRACK)
 """
 import resource
@@ -99,9 +100,11 @@ def bench_day(ncells, nfr):
 def bench_trk(ncells, nfr, which):
     sc = Scene(ncells)
     if which == "ot-rust":
-        tr = monte_python.ObjectTracker(backend="rust")
+        tr = monte_python.ObjectTracker(use_rust=True)
+    elif which == "ot-rust-m15g3":
+        tr = monte_python.ObjectTracker(use_rust=True, mend_dist=15, mend_gap=3)
     elif which == "ot-python":
-        tr = monte_python.ObjectTracker(backend="python")
+        tr = monte_python.ObjectTracker(use_rust=False)
     elif which == "streaming":
         tr = monte_python.StreamingTracker()
     elif which == "td1071":

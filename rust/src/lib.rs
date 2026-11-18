@@ -57,7 +57,7 @@ fn grow_labels<'py>(py: Python<'py>, labels: PyReadonlyArray2<'py, i32>, mask: P
     to_pyarray(py, ny, nx, out)
 }
 
-/// OverlapTracker(percent_overlap, cap_overlap, mend_tracks, mend_dist): streaming ObjectTracker core.
+/// OverlapTracker(percent_overlap, cap_overlap, mend_tracks, mend_dist, mend_gap): streaming ObjectTracker core.
 /// `.step(labels int32 2-D C-contiguous) -> int32 2-D` track ids (GIL released); `.records()` list of
 /// (frame, track, label, area, cy, cx); `.events()` list of (frame, kind, track, other_track, label).
 #[pyclass(module = "monte_python._rust")]
@@ -68,9 +68,9 @@ struct OverlapTracker {
 #[pymethods]
 impl OverlapTracker {
     #[new]
-    #[pyo3(signature = (percent_overlap=0.0, cap_overlap=false, mend_tracks=true, mend_dist=3.0))]
-    fn new(percent_overlap: f64, cap_overlap: bool, mend_tracks: bool, mend_dist: f64) -> Self {
-        OverlapTracker { inner: tracking::Tracker::new(percent_overlap, cap_overlap, mend_tracks, mend_dist) }
+    #[pyo3(signature = (percent_overlap=0.0, cap_overlap=false, mend_tracks=true, mend_dist=3.0, mend_gap=1))]
+    fn new(percent_overlap: f64, cap_overlap: bool, mend_tracks: bool, mend_dist: f64, mend_gap: i64) -> Self {
+        OverlapTracker { inner: tracking::Tracker::new(percent_overlap, cap_overlap, mend_tracks, mend_dist, mend_gap) }
     }
 
     fn step<'py>(&mut self, py: Python<'py>, labels: PyReadonlyArray2<'py, i32>) -> PyResult<Bound<'py, PyArray2<i32>>> {

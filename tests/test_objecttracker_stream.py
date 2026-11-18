@@ -146,3 +146,39 @@ def test_mend_uses_truncated_centroids():
     d = z.copy(); d[3:5, 5:8] = 1      # no overlap; centroid col 6.0: distance 4 truncated, 3.5 untruncated
     assert _both([a, d], mend_dist=3.75)[1].max() == 2   # not mended (untruncated centroids would mend)
     assert _both([a, d], mend_dist=4)[1].max() == 1
+
+
+@pytest.mark.skipif(_rust is None, reason="Rust extension not built")
+@pytest.mark.parametrize("seed,gap,md", [(s, g, md) for s in range(4) for g in (2, 3) for md in (6, 15)])
+def test_rust_equals_python_mend_gap(seed, gap, md):
+    data = storms(seed, nt=15)
+    data[4] = 0  # an empty frame: every track breaks for a frame
+    data[9][:, ::2] = 0  # thinned frame: fewer overlaps, more mends
+    r = ObjectTracker(use_rust=True, mend_dist=md, mend_gap=gap)
+    p = ObjectTracker(use_rust=False, mend_dist=md, mend_gap=gap)
+    for f in data:
+        np.testing.assert_array_equal(r.step(f), p.step(f))
+    assert r.events().equals(p.events())
+    assert r.table()[["frame", "track", "label", "area"]].equals(p.table()[["frame", "track", "label", "area"]])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_mend_gap_bridges_missing_frames(backend):
+    box = lambda x: np.pad(np.ones((3, 6), np.int32), ((10, 27), (x, 54 - x)))  # noqa: E731
+    z = np.zeros_like(box(0))
+    # 6 px wide, moves 4 px / frame (overlaps: motion 4 px); frames 3 and 4 missing: resumes 3 frames later
+    frames = [box(5 + 4 * k) if k not in (3, 4) else z for k in range(7)]
+    ids = lambda **kw: set(np.unique(ObjectTracker(use_rust=backend, **kw).track(frames))) - {0}  # noqa: E731
+    assert ids(mend_dist=1, mend_gap=1) == {1, 2}  # gap 1: the frame-2 track cannot reach frame 5
+    assert ids(mend_dist=1, mend_gap=2) == {1, 2}
+    assert ids(mend_dist=1, mend_gap=3) == {1}     # projected 3 x 4 px: exact
+    with pytest.raises(ValueError):
+        ObjectTracker(mend_gap=0)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_mend_gap_one_equals_default(backend):
+    data = storms(5, nt=15)
+    a = ObjectTracker(use_rust=backend, mend_dist=8).track(data)
+    b = ObjectTracker(use_rust=backend, mend_dist=8, mend_gap=1).track(data)
+    np.testing.assert_array_equal(a, b)

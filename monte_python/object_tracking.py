@@ -45,14 +45,15 @@ class _OverlapStepper:
     Per frame t (> 0): overlap pairs with frame t - 1 scored (1 if cap else 2) n / (|A| + |B|), kept if
     > percent_overlap, ranked by score (ties: previous track id, then label, ascending), greedy one-to-one; an
     unmatched object starts a track (pre-mend ids in label order, as ObjectTracker.relabel numbers them). With
-    mending, tracks of frame t - 1 not continued, in id order, take the nearest new track of frame t whose start
-    centroid lies within mend_dist of their end centroid + mean motion (truncated centroids, as
-    mend_broken_tracks); output ids follow the mend chains to their root.
+    mending, unmended tracks that ended at frame t - g (g = 1 .. mend_gap), in (g, id) order, take the nearest
+    unclaimed new track of frame t whose start centroid lies within mend_dist of their end centroid + g x mean
+    motion (truncated centroids, as mend_broken_tracks); output ids follow the mend chains to their root.
     """
 
-    def __init__(self, percent_overlap, cap_overlap, mend_tracks, mend_dist):
+    def __init__(self, percent_overlap, cap_overlap, mend_tracks, mend_dist, mend_gap=1):
         self.po, self.k = float(percent_overlap), 1.0 if cap_overlap else 2.0
-        self.mend, self.mend_dist = bool(mend_tracks), float(mend_dist)
+        self.mend, self.mend_dist, self.mend_gap = bool(mend_tracks), float(mend_dist), int(mend_gap)
+        self.dormant = {}      # pre-mend id -> end frame: ended, unmended tracks still within mend_gap
         self.frame = -1
         self.prev_idx = None   # previous frame: per pixel 0 or 1 + object index (int64)
         self.prev_pid = None   # previous frame: pre-mend track id per object
@@ -123,15 +124,20 @@ class _OverlapStepper:
         if self.prev_pid is not None:
             cont = set(pid[matched].tolist())
             ended = sorted(p for p in self.prev_pid.tolist() if p not in cont)
-            if self.mend and len(new) and ended:
+            if self.mend:
+                for L in ended:
+                    self.dormant[L] = t - 1
+            mended = set()
+            if self.mend and len(new) and self.dormant:
                 cand = [int(pid[ib]) for ib in new.tolist()]
                 new_lab = dict(zip(cand, new.tolist()))
                 taken = set()
-                for L in ended:
+                for L in sorted(self.dormant, key=lambda q: (-self.dormant[q], q)):
+                    g = t - self.dormant[L]
                     s0, x0, y0, x1, y1, nfr = self.trk[L]
                     dx = (x1 - x0) / (nfr - 1) if nfr > 1 else 0.0
                     dy = (y1 - y0) / (nfr - 1) if nfr > 1 else 0.0
-                    xp, yp = x1 + dx, y1 + dy
+                    xp, yp = x1 + g * dx, y1 + g * dy
                     best, bd = None, None
                     for S in cand:
                         if S in taken:
@@ -142,6 +148,7 @@ class _OverlapStepper:
                             best, bd = S, d
                     if best is not None:
                         taken.add(best)
+                        mended.add(L)
                         self.root[best] = self.root[L]
                         self._events.append((t, "mend", self.root[L], 0, int(lab[new_lab[best]])))
             if pa_l is not None:  # split / merge events (overlapping pairs that did not match), final ids
@@ -154,7 +161,11 @@ class _OverlapStepper:
                         self._events.append((t, "split", self.root[bp], self.root[ap], int(lab[ib])))
                     elif ap not in cont:
                         self._events.append((t, "merge", self.root[ap], self.root[bp], int(lab[ib])))
-            for L in ended:  # ended tracks are never seen again
+            if not self.mend:
+                for L in ended:  # ended tracks are never seen again
+                    self.trk.pop(L, None)
+            for L in [q for q, e in self.dormant.items() if q in mended or t - e >= self.mend_gap]:
+                del self.dormant[L]  # mended, or too old to be mended at t + 1
                 self.trk.pop(L, None)
         out = np.array([self.root[p] for p in pid.tolist()], np.int32)
         for ib, p in enumerate(pid.tolist()):
@@ -178,8 +189,9 @@ class ObjectTracker:
 
     With mend_tracks=True (default since v1.3) a track that ended at frame t is continued by the nearest new
     track starting at t + 1 whose start centroid is within ``mend_dist`` grid points of the ended track's end
-    centroid + mean motion (centroids truncated to grid points; ties: lowest id). Mending a track twice keeps the
-    first id. There is no motion advection in the matching itself (see StreamingTracker for that).
+    centroid + mean motion (centroids truncated to grid points; ties: lowest id). With ``mend_gap`` = G > 1 a
+    track missing for up to G - 1 frames can be mended too (start at t + g, projected g x motion; at each frame
+    the most recently ended tracks choose first). Mending a track twice keeps the first id. There is no motion advection in the matching itself (see StreamingTracker for that).
 
     Tracking streams (``step``, ``track_iter``): memory is two frames plus the active tracks, and the ids
     returned for a frame are final. ``track`` stacks the streamed frames.
@@ -192,7 +204,11 @@ class ObjectTracker:
     mend_tracks : bool, default True
         Mend broken tracks (above). v1.2 and earlier defaulted to False (and its mending had no effect).
     mend_dist : float, default 3
-        Maximum mending distance (grid points, Euclidean).
+        Maximum mending distance (grid points, Euclidean). The default 3 was set for 3-km WoFS at 5-min steps;
+        scale it with the grid spacing and the step (storm motion per step).
+    mend_gap : int, default 1
+        Frames from a track's last object to the mending object (1 = the next frame, as mend_broken_tracks).
+        ``track`` / ``step`` only: the batch reference (``_track_batch``) mends with gap 1.
     cap_overlap : bool, default False
         True: the original score |A n B| / (|A| + |B|) (at most 0.5), so the same percent_overlap is twice as
         strict as with Dice. Same ranking; with percent_overlap=0 the tracks are identical.
@@ -212,12 +228,16 @@ class ObjectTracker:
     Author: Montgomery Flora (git: monte-flora)
     Email : monte.flora@noaa.gov
     """
-    def __init__(self, percent_overlap=0.0, mend_tracks=True, mend_dist=3, cap_overlap=False, use_rust=None):
+    def __init__(self, percent_overlap=0.0, mend_tracks=True, mend_dist=3, cap_overlap=False, use_rust=None,
+                 mend_gap=1):
         if use_rust and _rust is None:
             raise ImportError("use_rust=True but monte_python._rust is not built (pip install with a Rust toolchain)")
         self._percent_overlap = float(percent_overlap)
         self._mend_tracks = bool(mend_tracks)
         self._mend_dist = float(mend_dist)
+        if int(mend_gap) < 1:
+            raise ValueError("mend_gap must be >= 1")
+        self._mend_gap = int(mend_gap)
         self._cap_overlap = bool(cap_overlap)
         self.use_rust = (_rust is not None) if use_rust is None else bool(use_rust)
         self.reset()
@@ -225,7 +245,8 @@ class ObjectTracker:
     def reset(self):
         """Forget the streaming state (``step``): the next frame starts frame 0 with fresh track ids."""
         impl = _rust.OverlapTracker if self.use_rust else _OverlapStepper
-        self._stepper = impl(self._percent_overlap, self._cap_overlap, self._mend_tracks, self._mend_dist)
+        self._stepper = impl(self._percent_overlap, self._cap_overlap, self._mend_tracks, self._mend_dist,
+                             self._mend_gap)
 
     def step(self, labels):
         """
